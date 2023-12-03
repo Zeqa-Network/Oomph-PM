@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace ethaniccc\Oomph;
 
+use ethaniccc\Oomph\event\OomphPunishmentEvent;
 use ethaniccc\Oomph\event\OomphViolationEvent;
 use ethaniccc\Oomph\session\OomphSession;
+use ethaniccc\Oomph\session\LoggedData;
 use pocketmine\command\Command;
 use pocketmine\command\CommandSender;
 use pocketmine\event\Listener;
@@ -13,196 +15,379 @@ use pocketmine\event\player\PlayerLoginEvent;
 use pocketmine\event\player\PlayerPreLoginEvent;
 use pocketmine\event\player\PlayerQuitEvent;
 use pocketmine\event\server\DataPacketReceiveEvent;
+use pocketmine\network\mcpe\PacketRateLimiter;
 use pocketmine\network\mcpe\protocol\ScriptMessagePacket;
+use pocketmine\network\mcpe\raklib\RakLibInterface;
 use pocketmine\player\Player;
 use pocketmine\player\PlayerInfo;
 use pocketmine\player\XboxLivePlayerInfo;
 use pocketmine\plugin\PluginBase;
 use pocketmine\scheduler\ClosureTask;
+use pocketmine\utils\AssumptionFailedError;
 use pocketmine\utils\TextFormat;
+use ReflectionClass;
+use ReflectionException;
 
 class Oomph extends PluginBase implements Listener {
 
-    private const VALID_EVENTS = [
-        "oomph:authentication",
-        "oomph:latency_report",
-        "oomph:flagged",
-    ];
+	private const VALID_EVENTS = [
+		"oomph:authentication",
+		"oomph:latency_report",
+		"oomph:flagged",
+	];
 
-    private static Oomph $instance;
+	private const DEFAULT_CHECK_SETTINGS = [
+		"enabled" => true,
+		"max_violations" => 1,
+		"punishment" => "none",
+	];
 
-    /** @var string[] */
-    public array $xuidList = [];
+	private static Oomph $instance;
 
-    /** @var OomphSession[] */
-    private array $alerted = [];
+	/** @var string[] */
+	public array $xuidList = [];
 
-    public static function getInstance(): Oomph {
-        return self::$instance;
-    }
+	/** @var OomphSession[] */
+	private array $alerted = [];
+	private ?RakLibInterface $netInterface = null;
 
-    public function onEnable(): void {
-        self::$instance = $this;
+	public function onEnable(): void {
+		self::$instance = $this;
 
-        if ($this->getConfig()->get("Version", "n/a") !== "1.0.0") {
-            @unlink($this->getDataFolder() . "config.yml");
-            $this->reloadConfig();
-        }
+		if ($this->getConfig()->get("Version", "n/a") !== "1.0.0") {
+			@unlink($this->getDataFolder() . "config.yml");
+			$this->reloadConfig();
+		}
 
-        $this->getScheduler()->scheduleRepeatingTask(new ClosureTask(function(): void {
-            $this->alerted = [];
-            foreach ($this->getServer()->getOnlinePlayers() as $player) {
-                if (!$player->hasPermission("Oomph.Alerts")) {
-                    continue;
-                }
+		if (!$this->getConfig()->get("Enabled", true)) {
+			$this->getLogger()->warning("Oomph set to disabled in config");
+			return;
+		}
 
-                $session = OomphSession::get($player);
-                if ($session === null) {
-                    continue;
-                }
+		$this->getScheduler()->scheduleDelayedTask(new ClosureTask(function(): void {
+			if ($this->netInterface === null) {
+				foreach ($this->getServer()->getNetwork()->getInterfaces() as $interface) {
+					if ($interface instanceof RakLibInterface) {
+						$this->netInterface = $interface;
+						break;
+					}
+				}
 
-                if (microtime(true) - $session->lastAlert < $session->alertDelay) {
-                    continue;
-                }
+				if ($this->netInterface === null) {
+					throw new AssumptionFailedError("raklib interface not found");
+				}
+				$this->netInterface->setPacketLimit(PHP_INT_MAX); // TODO: not set this to PHP_INT_MAX.
+			}
+		}), 1);
 
-                $this->alerted[] = $session;
-            }
-        }), 1);
+		$this->getScheduler()->scheduleRepeatingTask(new ClosureTask(function(): void {
+			$this->alerted = [];
+			foreach ($this->getServer()->getOnlinePlayers() as $player) {
+				if (!$player->hasPermission("Oomph.Alerts")) {
+					continue;
+				}
 
-        $this->getServer()->getPluginManager()->registerEvents($this, $this);
-    }
+				$session = OomphSession::get($player);
+				if ($session === null) {
+					continue;
+				}
 
-    public function onCommand(CommandSender $sender, Command $command, string $label, array $args): bool {
-        if (!$sender instanceof Player) {
-            return false;
-        }
+				if (microtime(true) - $session->lastAlert < $session->alertDelay) {
+					continue;
+				}
 
-        switch ($command->getName()) {
-            case "oalerts":
-            case "odelay":
-                if (!$sender->hasPermission("Oomph.Alerts")) {
-                    $sender->sendMessage(TextFormat::RED . "Insufficient permissions");
-                    return true;
-                }
+				$this->alerted[] = $session;
+			}
+		}), 1);
 
-                $session = OomphSession::get($sender);
-                if ($session === null) {
-                    $sender->sendMessage(TextFormat::RED . "Unexpected null session.");
-                    return true;
-                }
+		$this->getServer()->getPluginManager()->registerEvents($this, $this);
+	}
 
-                if ($command->getName() === "oalerts") {
-                    $session->alertsEnabled = !$session->alertsEnabled;
-                    if ($session->alertsEnabled) {
-                        $sender->sendMessage(TextFormat::GREEN . "Alerts enabled.");
-                    } else {
-                        $sender->sendMessage(TextFormat::RED . "Alerts disabled.");
-                    }
-                } else {
-                    $delay = max((float) ($args[0] ?? 3), 0.05);
-                    $session->alertDelay = $delay;
-                    $sender->sendMessage(TextFormat::GREEN . "Alert delay set to $delay seconds");
-                }
+	public function onCommand(CommandSender $sender, Command $command, string $label, array $args): bool {
+		switch ($command->getName()) {
+			case "oalerts":
+			case "odelay":
+				if (!$sender instanceof Player) {
+					return false;
+				}
 
-                return true;
-        }
+				if (!$sender->hasPermission("Oomph.Alerts")) {
+					$sender->sendMessage(TextFormat::RED . "Insufficient permissions");
+					return true;
+				}
 
-        return false;
-    }
+				$session = OomphSession::get($sender);
+				if ($session === null) {
+					$sender->sendMessage(TextFormat::RED . "Unexpected null session.");
+					return true;
+				}
 
+				if ($command->getName() === "oalerts") {
+					$session->alertsEnabled = !$session->alertsEnabled;
+					if ($session->alertsEnabled) {
+						$sender->sendMessage(TextFormat::GREEN . "Alerts enabled.");
+					} else {
+						$sender->sendMessage(TextFormat::RED . "Alerts disabled.");
+					}
+				} else {
+					$delay = max((float) ($args[0] ?? 3), 0.05);
+					$session->alertDelay = $delay;
+					$sender->sendMessage(TextFormat::GREEN . "Alert delay set to $delay seconds");
+				}
 
-    /**
-     * @param PlayerPreLoginEvent $event
-     * @priority HIGHEST
-     * @ignoreCancelled true
-     * @throws \ReflectionException
-     */
-    public function onPreLogin(PlayerPreLoginEvent $event): void {
-        $ref = (new \ReflectionClass($event))->getProperty("playerInfo");
-        /** @var PlayerInfo $playerInfo */
-        $playerInfo = $ref->getValue($event);
-        $extraData = $playerInfo->getExtraData();
-        $extraData["Xuid"] =  $this->xuidList["{$event->getIp()}:{$event->getPort()}"];
-        $extraData["Username"] = $playerInfo->getUsername();
-        $playerInfo = new XboxLivePlayerInfo(
-            $this->xuidList["{$event->getIp()}:{$event->getPort()}"],
-            $playerInfo->getUsername(),
-            $playerInfo->getUuid(),
-            $playerInfo->getSkin(),
-            $playerInfo->getLocale(),
-            $extraData,
-        );
-        $ref->setValue($event, $playerInfo);
-    }
+				return true;
+			case "ologs":
+				if (!$sender->hasPermission("Oomph.Logs")) {
+					$sender->sendMessage(TextFormat::RED . "Insufficient permissions.");
+					return true;
+				}
 
-    public function onLogin(PlayerLoginEvent $event): void {
-        $player = $event->getPlayer();
-        (new \ReflectionClass($player))->getProperty("xuid")->setValue($player, $this->xuidList["{$player->getNetworkSession()->getIp()}:{$player->getNetworkSession()->getPort()}"]);
-        unset($this->xuidList["{$player->getNetworkSession()->getIp()}:{$player->getNetworkSession()->getPort()}"]);
+				$arg = $args[0] ?? null;
+				if ($arg === null) {
+					$sender->sendMessage(TextFormat::RED . "Please specify a player to obtain their logs.");
+					return true;
+				}
 
-        OomphSession::register($player);
-    }
+				$target = $this->getServer()->getPlayerByPrefix($arg);
+				if ($target === null) {
+					$sender->sendMessage(TextFormat::RED . "Player not found.");
+					return true;
+				}
 
-    public function onQuit(PlayerQuitEvent $event): void {
-        OomphSession::unregister($event->getPlayer());
-    }
+				$data = LoggedData::getInstance()->get($target->getName());
+				if (count($data) === 0) {
+					$sender->sendMessage(str_replace(
+						["{prefix}", "{player}"],
+						[$this->getConfig()->get("Prefix", "§7§l[§eoomph§7]§r"), $target->getName()],
+						$this->getConfig()->get("NoLogMessage", "{prefix} §a{player} has no existing logs.")
+					));
+					return true;
+				}
 
-    /** @priority HIGHEST */
-    public function onClientPacket(DataPacketReceiveEvent $event): void {
-        $player = $event->getOrigin()->getPlayer();
-        $packet = $event->getPacket();
+				$message = str_replace(
+						["{prefix}", "{player}"],
+						[$this->getConfig()->get("Prefix", "§7§l[§eoomph§7]§r"), $target->getName()],
+						$this->getConfig()->get("StartLogMessage", "{prefix} §5Log summary for §d{player}:")
+					) . PHP_EOL;
+				foreach ($data as $k => $datum) {
+					$message .= str_replace(
+						["{check_main}", "{check_sub}", "{violations}"],
+						[$datum["check_main"], $datum["check_sub"], var_export((float) $datum["violations"], true)],
+						$this->getConfig()->get("LogMessage", "§5{check_main}§7<§d{check_main}§7> §cx{violations}")
+					);
 
-        if (!$packet instanceof ScriptMessagePacket) {
-            return;
-        }
+					if ($k !== count($data) - 1) {
+						$message .= PHP_EOL;
+					}
+				}
+				$sender->sendMessage($message);
 
-        $eventType = $packet->getMessageId();
+				return true;
+		}
 
-        if (!in_array($eventType, self::VALID_EVENTS)) {
-            return;
-        }
+		return false;
+	}
 
-        $data = json_decode($packet->getValue(), true);
-        if ($data === null) {
-            return;
-        }
+	public static function getInstance(): Oomph {
+		return self::$instance;
+	}
 
-        $event->cancel();
-        switch ($eventType) {
-            case "oomph:authentication":
-                $this->xuidList[$event->getOrigin()->getIp() . ":" . $event->getOrigin()->getPort()] = $data["xuid"];
-                break;
-            case "oomph:latency_report":
-                if ($player === null) {
-                    return;
-                }
+	/**
+	 * @param PlayerPreLoginEvent $event
+	 * @priority HIGHEST
+	 * @ignoreCancelled true
+	 * @throws ReflectionException
+	 */
+	public function onPreLogin(PlayerPreLoginEvent $event): void {
+		if ($this->getConfig()->get("Allow-NonOomph-Conn") && $event->getPlayerInfo() instanceof XboxLivePlayerInfo) {
+			return;
+		}
 
-                $player->getNetworkSession()->updatePing((int) $data["raknet"]);
-                break;
-            case "oomph:flagged":
-                if ($player === null) {
-                    return;
-                }
+		// Kick the player if data has not been received from Oomph validating their login.
+		if (!isset($this->xuidList["{$event->getIp()}:{$event->getPort()}"])) {
+			$event->setKickFlag(
+				PlayerPreLoginEvent::KICK_FLAG_PLUGIN,
+				"oomph authentication data not found for {$event->getPlayerInfo()->getUsername()}",
+				"failed to initialize session - please try logging in again."
+			);
+			return;
+		}
 
-                $message = $this->getConfig()->get("message", "{prefix} §d{player} §7flagged §4{check_main} §7(§c{check_sub}§7) §7[§5x{violations}§7]");
-                $message = str_replace(
-                    ["{prefix}", "{player}", "{check_main}", "{check_sub}", "{violations}"],
-                    [$this->getConfig()->get("Prefix", "§l§7[§eoomph§7]"), $data["player"], $data["check_main"], $data["check_sub"], $data["violations"]],
-                    $message
-                );
+		$ref = (new ReflectionClass($event))->getProperty("playerInfo");
+		/** @var PlayerInfo $playerInfo */
+		$playerInfo = $ref->getValue($event);
+		$extraData = $playerInfo->getExtraData();
+		$extraData["Xuid"] = $this->xuidList["{$event->getIp()}:{$event->getPort()}"];
+		$extraData["Username"] = $playerInfo->getUsername();
+		$playerInfo = new XboxLivePlayerInfo(
+			$this->xuidList["{$event->getIp()}:{$event->getPort()}"],
+			$playerInfo->getUsername(),
+			$playerInfo->getUuid(),
+			$playerInfo->getSkin(),
+			$playerInfo->getLocale(),
+			$extraData,
+		);
+		$ref->setValue($event, $playerInfo);
+		$event->setAuthRequired(false);
+	}
 
-                $ev = new OomphViolationEvent($player, $data["check_main"], $data["check_sub"], round($data["violations"], 2));
-                $ev->call();
+	/**
+	 * @priority HIGHEST
+	 * @param PlayerLoginEvent $event
+	 * @return void
+	 * @throws ReflectionException
+	 */
+	public function onLogin(PlayerLoginEvent $event): void {
+		$player = $event->getPlayer();
+		$xuid = $this->xuidList["{$player->getNetworkSession()->getIp()}:{$player->getNetworkSession()->getPort()}"] ?? null;
+		if ($xuid === null) {
+			if ($this->getConfig()->get("Allow-NonOomph-Conn")) {
+				return;
+			}
 
-                if (!$ev->isCancelled()) {
-                    foreach ($this->alerted as $session) {
-                        $session->getPlayer()->sendMessage($message);
-                        $session->lastAlert = microtime(true);
-                    }
-                }
+			$event->setKickMessage("failed to initialize session - please try logging in again.");
+			$event->cancel();
+			return;
+		}
 
-                break;
-        }
-    }
+		$ref = new ReflectionClass($player);
+		$ref->getProperty("xuid")->setValue($player, $xuid);
+		$ref->getProperty("authenticated")->setValue($player, true);
+		unset($this->xuidList["{$player->getNetworkSession()->getIp()}:{$player->getNetworkSession()->getPort()}"]);
+
+		OomphSession::register($player);
+	}
+
+	public function onQuit(PlayerQuitEvent $event): void {
+		OomphSession::unregister($event->getPlayer());
+	}
+
+	/**
+	 * @priority HIGHEST
+	 * @param DataPacketReceiveEvent $event
+	 * @return void
+	 * @throws ReflectionException'
+	 */
+	public function onClientPacket(DataPacketReceiveEvent $event): void {
+		$player = $event->getOrigin()->getPlayer();
+		$packet = $event->getPacket();
+
+		if (!$packet instanceof ScriptMessagePacket) {
+			return;
+		}
+
+		$eventType = $packet->getMessageId();
+		if (!in_array($eventType, self::VALID_EVENTS)) {
+			return;
+		}
+
+		$data = json_decode($packet->getValue(), true);
+		if ($data === null) {
+			return;
+		}
+
+		$event->cancel();
+		switch ($eventType) {
+			case "oomph:authentication":
+				if ($player !== null) {
+					$this->getLogger()->warning("invalid authentication attempt from {$event->getOrigin()->getIp()}:{$event->getOrigin()->getPort()}");
+					return;
+				}
+
+				if (!$this->getConfig()->get("Allow-NonOomph-Conn") && !in_array($event->getOrigin()->getIp(), $this->getConfig()->get("Allowed-Connections", ["127.0.0.1"]))) {
+					$this->getLogger()->warning("invalid connection from {$event->getOrigin()->getIp()} with XUID " . $data["xuid"]);
+					$event->getOrigin()->disconnect("invalid connection [error: 1]");
+					return;
+				}
+
+				$netRef = new ReflectionClass($event->getOrigin());
+				$netRef->getProperty("ip")->setValue($event->getOrigin(), explode(":", $data["address"])[0]);
+				$netRef->getProperty("packetBatchLimiter")->setValue($event->getOrigin(), new PacketRateLimiter("Packet Batches", 1_000_000, 1_000_000));
+				$netRef->getProperty("gamePacketLimiter")->setValue($event->getOrigin(), new PacketRateLimiter("Game Packets", 1_000_000, 1_000_000));
+
+				$this->xuidList[$event->getOrigin()->getIp() . ":" . $event->getOrigin()->getPort()] = $data["xuid"];
+				break;
+			case "oomph:latency_report":
+				if ($player === null) {
+					return;
+				}
+
+				if (OomphSession::get($player) === null) {
+					return;
+				}
+
+				$player->getNetworkSession()->updatePing((int) $data["raknet"]);
+				break;
+			case "oomph:flagged":
+				if ($player === null) {
+					return;
+				}
+
+				if (OomphSession::get($player) === null) {
+					return;
+				}
+
+				$data["violations"] = round($data["violations"], 2);
+
+				$message = $this->getConfig()->get("FlaggedMessage", "{prefix} §d{player} §7flagged §4{check_main} §7(§c{check_sub}§7) §7[§5x{violations}§7]");
+				$message = str_replace(
+					["{prefix}", "{player}", "{check_main}", "{check_sub}", "{violations}", "{ping}"],
+					[$this->getConfig()->get("Prefix", "§l§7[§eoomph§7]"), $data["player"], $data["check_main"], $data["check_sub"], $data["violations"], $player->getNetworkSession()->getPing()],
+					$message
+				);
+				$ev = new OomphViolationEvent($player, $data["check_main"], $data["check_sub"], $data["violations"]);
+				if (!$this->getConfig()->getNested("{$ev->getCheckName()}.{$ev->getCheckType()}", self::DEFAULT_CHECK_SETTINGS)["enabled"] ?? true) {
+					$ev->cancel();
+				}
+
+				$ev->call();
+				if (!$ev->isCancelled()) {
+					LoggedData::getInstance()->add($player->getName(), $data);
+					foreach ($this->alerted as $session) {
+						$session->getPlayer()->sendMessage($message);
+						$session->lastAlert = microtime(true);
+					}
+
+					$this->checkForPunishments($player, $ev->getCheckName(), $ev->getCheckType(), $ev->getViolations());
+				}
+
+				break;
+		}
+	}
+
+	private function checkForPunishments(Player $player, string $check, string $type, float $violations): void {
+		$settings = $this->getConfig()->getNested("$check.$type", self::DEFAULT_CHECK_SETTINGS);
+		if (($settings["punishment"] ?? "none") === "none") {
+			return;
+		}
+		$punishmentType = OomphPunishmentEvent::punishmentTypeFromString($settings["punishment"]);
+
+		if ($violations < ($settings["max_violations"] ?? 10)) {
+			return;
+		}
+
+		$ev = new OomphPunishmentEvent($player, $punishmentType);
+		$ev->call();
+
+		if ($ev->isCancelled()) {
+			return;
+		}
+
+		if ($punishmentType === OomphPunishmentEvent::TYPE_KICK) {
+			$player->kick(str_replace(
+				["{prefix}", "{check_main}", "{check_sub}"],
+				[$this->getPrefix(), $check, $type],
+				$this->getConfig()->get("KickMessage", "{prefix} §cKicked for the usage of third-party software.")
+			));
+
+			return;
+		}
+
+		$this->getServer()->getNameBans()->addBan($player->getName(), $this->getConfig()->get("BanMessage", "{prefix} §cBanned for the usage of third-party software."), null, "Oomph");
+	}
+
+	public function getPrefix(): string {
+		return $this->getConfig()->get("Prefix", "§7§l[§eoomph§7]§r");
+	}
 
 }
