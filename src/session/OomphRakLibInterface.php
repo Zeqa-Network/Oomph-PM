@@ -26,15 +26,17 @@ class OomphRakLibInterface extends RakLibInterface{
 	 * @throws ReflectionException
 	 */
 	public function onClientConnect(int $sessionId, string $address, int $port, int $clientID) : void{
-		$session = new OomphNetworkSession(
+        $packetBroadcaster = new StandardPacketBroadcaster(Server::getInstance(), ProtocolInfo::CURRENT_PROTOCOL);
+        $entityEventBroadcaster = new StandardEntityEventBroadcaster($packetBroadcaster);
+        $session = new OomphNetworkSession(
 			Server::getInstance(),
 			ReflectionUtils::getProperty(RakLibInterface::class, $this, "network")->getSessionManager(),
 			PacketPool::getInstance(),
 			new RakLibPacketSender($sessionId, $this),
-			ReflectionUtils::getProperty(RakLibInterface::class, $this, "packetBroadcaster"),
-			ReflectionUtils::getProperty(RakLibInterface::class, $this, "entityEventBroadcaster"),
+            $packetBroadcaster,
+            $entityEventBroadcaster,
 			ZlibCompressor::getInstance(),
-			ReflectionUtils::getProperty(RakLibInterface::class, $this, "typeConverter"),
+			TypeConverter::getInstance(),
 			$address,
 			$port
 		);

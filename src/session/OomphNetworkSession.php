@@ -40,7 +40,7 @@ class OomphNetworkSession extends NetworkSession {
 	private bool $isFirstPacket = true;
 	public function __construct(Server $server, NetworkSessionManager $manager, PacketPool $packetPool, PacketSender $sender, PacketBroadcaster $broadcaster, EntityEventBroadcaster $entityEventBroadcaster,Compressor $compressor, TypeConverter $typeConverter, string $ip, int $port
 	) {
-		parent::__construct($server, $manager, $packetPool, $sender, $broadcaster, $entityEventBroadcaster, $compressor, $typeConverter, $ip, $port);
+		parent::__construct($server, $manager, $packetPool, $sender, $broadcaster, $entityEventBroadcaster, $compressor, $ip, $port);
 		$this->refl = new \ReflectionClass(NetworkSession::class);
 	}
 
