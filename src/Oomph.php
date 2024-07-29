@@ -1,32 +1,44 @@
 <?php
 
-declare(strict_types=1);
-
 namespace ethaniccc\Oomph;
 
 use ethaniccc\Oomph\event\OomphPunishmentEvent;
 use ethaniccc\Oomph\event\OomphViolationEvent;
+use ethaniccc\Oomph\session\OomphNetworkSession;
+use ethaniccc\Oomph\session\OomphRakLibInterface;
 use ethaniccc\Oomph\session\OomphSession;
 use ethaniccc\Oomph\session\LoggedData;
 use pocketmine\command\Command;
 use pocketmine\command\CommandSender;
+use pocketmine\event\EventPriority;
 use pocketmine\event\Listener;
+use pocketmine\event\player\PlayerCreationEvent;
+use pocketmine\event\player\PlayerJoinEvent;
 use pocketmine\event\player\PlayerLoginEvent;
 use pocketmine\event\player\PlayerPreLoginEvent;
 use pocketmine\event\player\PlayerQuitEvent;
+use pocketmine\event\player\PlayerToggleFlightEvent;
 use pocketmine\event\server\DataPacketReceiveEvent;
+use pocketmine\event\server\NetworkInterfaceRegisterEvent;
+use pocketmine\network\mcpe\NetworkSession;
 use pocketmine\network\mcpe\PacketRateLimiter;
+use pocketmine\network\mcpe\protocol\PlayerAuthInputPacket;
 use pocketmine\network\mcpe\protocol\ScriptMessagePacket;
+use pocketmine\network\mcpe\protocol\types\PlayerAuthInputFlags;
 use pocketmine\network\mcpe\raklib\RakLibInterface;
+use pocketmine\network\query\DedicatedQueryNetworkInterface;
 use pocketmine\player\Player;
 use pocketmine\player\PlayerInfo;
 use pocketmine\player\XboxLivePlayerInfo;
 use pocketmine\plugin\PluginBase;
 use pocketmine\scheduler\ClosureTask;
+use pocketmine\Server;
 use pocketmine\utils\AssumptionFailedError;
 use pocketmine\utils\TextFormat;
 use ReflectionClass;
 use ReflectionException;
+
+use const pocketmine\BEDROCK_DATA_PATH;
 
 class Oomph extends PluginBase implements Listener {
 
@@ -47,17 +59,40 @@ class Oomph extends PluginBase implements Listener {
 	/** @var string[] */
 	public array $xuidList = [];
 
+	public string $alertPermission;
+	public string $logPermission;
+
 	/** @var OomphSession[] */
 	private array $alerted = [];
 	private ?RakLibInterface $netInterface = null;
 
 	public function onEnable(): void {
+
+		/* if (!str_ends_with(BEDROCK_DATA_PATH, "pocketmine/bedrock-data/")) {
+			$this->getLogger()->emergency("Pocketmine spoons are not supported");
+			$this->getServer()->forceShutdown();
+		} */
+
 		self::$instance = $this;
 
-		if ($this->getConfig()->get("Version", "n/a") !== "1.0.0") {
+		$this->getServer()->getNetwork()->registerInterface(new OomphRakLibInterface($this->getServer(), $this->getServer()->getIp(), $this->getServer()->getPort(), false)); // do we want upstream connection to use ipv6 (tip: we could load balance by having some upstream connections on ipv4 and some on ipv6)
+
+		$this->getServer()->getPluginManager()->registerEvent(NetworkInterfaceRegisterEvent::class, function(NetworkInterfaceRegisterEvent $event) : void{
+			$interface = $event->getInterface();
+			if($interface instanceof OomphRakLibInterface || (!$interface instanceof RakLibInterface && !$interface instanceof DedicatedQueryNetworkInterface)){
+				return;
+			}
+			$this->getLogger()->debug("Prevented network interface " . get_class($interface) . " from being registered");
+			$event->cancel();
+		}, EventPriority::NORMAL, $this);
+
+		if ($this->getConfig()->get("Version", "n/a") !== "1.0.1") {
 			@unlink($this->getDataFolder() . "config.yml");
 			$this->reloadConfig();
 		}
+
+		$this->alertPermission = $this->getConfig()->get("Alert-Permission", "Oomph.Alerts");
+		$this->logPermission = $this->getConfig()->get("Logs-Permission", "Oomph.Logs");
 
 		if (!$this->getConfig()->get("Enabled", true)) {
 			$this->getLogger()->warning("Oomph set to disabled in config");
@@ -78,12 +113,16 @@ class Oomph extends PluginBase implements Listener {
 				}
 				$this->netInterface->setPacketLimit(PHP_INT_MAX); // TODO: not set this to PHP_INT_MAX.
 			}
+
+			$this->getServer()->getCommandMap()->getCommand("oalerts")?->setPermission($this->alertPermission);
+			$this->getServer()->getCommandMap()->getCommand("odelay")?->setPermission($this->alertPermission);
+			$this->getServer()->getCommandMap()->getCommand("ologs")?->setPermission($this->logPermission);
 		}), 1);
 
 		$this->getScheduler()->scheduleRepeatingTask(new ClosureTask(function(): void {
 			$this->alerted = [];
 			foreach ($this->getServer()->getOnlinePlayers() as $player) {
-				if (!$player->hasPermission("Oomph.Alerts")) {
+				if (!$player->hasPermission($this->alertPermission)) {
 					continue;
 				}
 
@@ -92,7 +131,12 @@ class Oomph extends PluginBase implements Listener {
 					continue;
 				}
 
-				if (microtime(true) - $session->lastAlert < $session->alertDelay) {
+				if (!$session->authorized) {
+					$session->authorized = true;
+					$session->alertsEnabled = true;
+				}
+
+				if (!$session->alertsEnabled || microtime(true) - $session->lastAlert < $session->alertDelay) {
 					continue;
 				}
 
@@ -111,7 +155,7 @@ class Oomph extends PluginBase implements Listener {
 					return false;
 				}
 
-				if (!$sender->hasPermission("Oomph.Alerts")) {
+				if (!$sender->hasPermission($this->alertPermission)) {
 					$sender->sendMessage(TextFormat::RED . "Insufficient permissions");
 					return true;
 				}
@@ -130,14 +174,14 @@ class Oomph extends PluginBase implements Listener {
 						$sender->sendMessage(TextFormat::RED . "Alerts disabled.");
 					}
 				} else {
-					$delay = max((float) ($args[0] ?? 3), 0.05);
+					$delay = max((float) ($args[0] ?? 3), 0.0001);
 					$session->alertDelay = $delay;
 					$sender->sendMessage(TextFormat::GREEN . "Alert delay set to $delay seconds");
 				}
 
 				return true;
 			case "ologs":
-				if (!$sender->hasPermission("Oomph.Logs")) {
+				if (!$sender->hasPermission($this->logPermission)) {
 					$sender->sendMessage(TextFormat::RED . "Insufficient permissions.");
 					return true;
 				}
@@ -190,6 +234,20 @@ class Oomph extends PluginBase implements Listener {
 
 	public static function getInstance(): Oomph {
 		return self::$instance;
+	}
+
+	/**
+	 * @param PlayerToggleFlightEvent $event
+	 * @priority HIGHEST
+	 * @ignoreCancelled TRUE
+	 * We do this because for some reason PM doesn't handle it themselves... lmao!
+	 */
+	public function onToggleFlight(PlayerToggleFlightEvent $event): void {
+		$var1 = var_export($event->isFlying(), true);
+		$var2 = var_export($event->getPlayer()->getAllowFlight(), true);
+		if ($event->isFlying() && !$event->getPlayer()->getAllowFlight()) {
+			$event->cancel();
+		}
 	}
 
 	/**
@@ -258,6 +316,10 @@ class Oomph extends PluginBase implements Listener {
 		OomphSession::register($player);
 	}
 
+	public function onJoin(PlayerJoinEvent $event): void {
+		$player = $event->getPlayer();
+	}
+
 	public function onQuit(PlayerQuitEvent $event): void {
 		OomphSession::unregister($event->getPlayer());
 	}
@@ -271,6 +333,13 @@ class Oomph extends PluginBase implements Listener {
 	public function onClientPacket(DataPacketReceiveEvent $event): void {
 		$player = $event->getOrigin()->getPlayer();
 		$packet = $event->getPacket();
+
+		// The fact we even have to do this is stupid LMAO.
+		// Remember to notify dylanthecat!!!
+		if ($packet instanceof PlayerAuthInputPacket && $packet->hasFlag(PlayerAuthInputFlags::START_FLYING) && !$player->getAllowFlight()) {
+			$player?->getNetworkSession()->syncAbilities($player);
+			return;
+		}
 
 		if (!$packet instanceof ScriptMessagePacket) {
 			return;
@@ -300,10 +369,18 @@ class Oomph extends PluginBase implements Listener {
 					return;
 				}
 
-				$netRef = new ReflectionClass($event->getOrigin());
-				$netRef->getProperty("ip")->setValue($event->getOrigin(), explode(":", $data["address"])[0]);
-				$netRef->getProperty("packetBatchLimiter")->setValue($event->getOrigin(), new PacketRateLimiter("Packet Batches", 1_000_000, 1_000_000));
-				$netRef->getProperty("gamePacketLimiter")->setValue($event->getOrigin(), new PacketRateLimiter("Game Packets", 1_000_000, 1_000_000));
+				$netRef = new ReflectionClass(NetworkSession::class);
+				$addrArray = explode(":", $data["address"]);
+				if (str_contains($data["address"], "[") && str_contains($data["address"], "]")) {
+					preg_match('#\[(.*?)\]#', $data["address"], $match);
+					$netRef->getProperty("ip")->setValue($event->getOrigin(), $match[1] ?? "::1");
+				} else {
+					$netRef->getProperty("ip")->setValue($event->getOrigin(), $addrArray[0]);
+				}
+				$netRef->getProperty("port")->setValue($event->getOrigin(), (int) end($addrArray));
+
+				$netRef->getProperty("packetBatchLimiter")->setValue($event->getOrigin(), new PacketRateLimiter("Packet Batches", (int) floor(sqrt(PHP_INT_MAX)), floor(sqrt(PHP_INT_MAX)), PHP_INT_MAX));
+				$netRef->getProperty("gamePacketLimiter")->setValue($event->getOrigin(), new PacketRateLimiter("Game Packets", (int) floor(sqrt(PHP_INT_MAX)), floor(sqrt(PHP_INT_MAX)), PHP_INT_MAX));
 
 				$this->xuidList[$event->getOrigin()->getIp() . ":" . $event->getOrigin()->getPort()] = $data["xuid"];
 				break;
@@ -329,10 +406,10 @@ class Oomph extends PluginBase implements Listener {
 
 				$data["violations"] = round($data["violations"], 2);
 
-				$message = $this->getConfig()->get("FlaggedMessage", "{prefix} §d{player} §7flagged §4{check_main} §7(§c{check_sub}§7) §7[§5x{violations}§7]");
+				$message = $this->getConfig()->get("FlaggedMessage", "{prefix} §d{player} §7flagged §4{check_main} §7(§c{check_sub}§7) §7[§5x{violations}§7] §f{extra_data}");
 				$message = str_replace(
-					["{prefix}", "{player}", "{check_main}", "{check_sub}", "{violations}", "{ping}"],
-					[$this->getConfig()->get("Prefix", "§l§7[§eoomph§7]"), $data["player"], $data["check_main"], $data["check_sub"], $data["violations"], $player->getNetworkSession()->getPing()],
+					["{prefix}", "{player}", "{check_main}", "{check_sub}", "{violations}", "{extra_data}"],
+					[$this->getConfig()->get("Prefix", "§l§7[§eoomph§7]"), $data["player"], $data["check_main"], $data["check_sub"], $data["violations"], $data["extraData"]],
 					$message
 				);
 				$ev = new OomphViolationEvent($player, $data["check_main"], $data["check_sub"], $data["violations"]);
