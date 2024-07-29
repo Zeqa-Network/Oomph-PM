@@ -263,13 +263,12 @@ class Oomph extends PluginBase implements Listener {
 
 		// Kick the player if data has not been received from Oomph validating their login.
 		if (!isset($this->xuidList["{$event->getIp()}:{$event->getPort()}"])) {
-			$event->setKickFlag(
-				PlayerPreLoginEvent::KICK_FLAG_PLUGIN,
-				"oomph authentication data not found for {$event->getPlayerInfo()->getUsername()}",
-				"failed to initialize session - please try logging in again."
-			);
-			return;
-		}
+            $event->setKickReason(
+                PlayerPreLoginEvent::KICK_REASON_PLUGIN,
+                "oomph authentication data not found for {$event->getPlayerInfo()->getUsername()}",
+                "failed to initialize session - please try logging in again."
+            );
+        }
 
 		$ref = (new ReflectionClass($event))->getProperty("playerInfo");
 		/** @var PlayerInfo $playerInfo */
