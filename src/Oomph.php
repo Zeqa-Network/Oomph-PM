@@ -268,6 +268,7 @@ class Oomph extends PluginBase implements Listener {
                 "oomph authentication data not found for {$event->getPlayerInfo()->getUsername()}",
                 "failed to initialize session - please try logging in again."
             );
+            return;
         }
 
 		$ref = (new ReflectionClass($event))->getProperty("playerInfo");
